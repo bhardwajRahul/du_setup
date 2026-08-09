@@ -1,11 +1,13 @@
 #!/bin/bash
 
 # Debian and Ubuntu Server Hardening Interactive Script
-# Version: 0.81.2 | 2026-08-08
+# Version: 0.81.3 | 2026-08-09
 # Changelog:
+# - v0.81.3: Switch Fail2Ban UFW banaction to native nftables (nftables-allports) for maximum performance and modern standard compliance.
+#            Ensure 'nftables' package is installed for minimal server compatibility.
 # - v0.81.2: Switch Fail2Ban UFW banaction to ipset for improved performance when handling large ban lists.
 #            Update UFW SSH rule from allow to limit to provide native brute-force protection.
-# - v0.81.1: Fix IPv6 connectivity issues with Secure DNS. 
+# - v0.81.1: Fix IPv6 connectivity issues with Secure DNS.
 #            Implement Docker-compatible IPv6 SLAAC sysctl configuration and enable native IPv6 networking in Docker daemon.
 # - v0.81.0: Added optional encrypted DNS (DoT) setup using Quad9 and Cloudflare.
 #            Includes automatic installation of systemd-resolved if needed and configuration to block tracking protocols.
@@ -282,7 +284,7 @@ print_header() {
     printf '%s\n' "${CYAN}╔═════════════════════════════════════════════════════════════════╗${NC}"
     printf '%s\n' "${CYAN}║                                                                 ║${NC}"
     printf '%s\n' "${CYAN}║       DEBIAN/UBUNTU SERVER SETUP AND HARDENING SCRIPT           ║${NC}"
-    printf '%s\n' "${CYAN}║                      v0.81.2 | 2026-08-08                       ║${NC}"
+    printf '%s\n' "${CYAN}║                      v0.81.3 | 2026-08-09                       ║${NC}"
     printf '%s\n' "${CYAN}║                                                                 ║${NC}"
     printf '%s\n' "${CYAN}╚═════════════════════════════════════════════════════════════════╝${NC}"
     printf '\n'
@@ -4065,11 +4067,10 @@ configure_firewall() {
 configure_fail2ban() {
     print_section "Fail2Ban Configuration"
 
-    # Install Fail2Ban if not present
-    if ! dpkg -l fail2ban | grep -q ^ii || ! dpkg -l ipset | grep -q ^ii; then
-        print_info "Installing Fail2Ban and ipset..."
-        if ! apt-get install -y -qq fail2ban ipset; then
-            print_error "Failed to install Fail2Ban or ipset."
+    if ! dpkg -l fail2ban | grep -q ^ii || ! dpkg -l nftables | grep -q ^ii; then
+        print_info "Installing Fail2Ban and nftables..."
+        if ! apt-get install -y -qq fail2ban nftables; then
+            print_error "Failed to install Fail2Ban or nftables."
             return 1
         fi
     fi
@@ -4178,6 +4179,20 @@ ignoreregex =
 EOF
 )
 
+    local NFTABLES_ALLPORTS_LOCAL
+    NFTABLES_ALLPORTS_LOCAL=$(cat <<'EOF'
+[Init]
+# Ensure Fail2Ban silently drops packets
+blocktype = drop
+# Drop all protocols for a banned IP (older Fail2Ban versions)
+nftables_match =
+
+[Definition]
+# Drop all protocols for a banned IP (newer Fail2Ban versions)
+rule_match-allports =
+EOF
+)
+
     local JAIL_LOCAL_CONFIG
     JAIL_LOCAL_CONFIG=$(cat <<EOF
 [DEFAULT]
@@ -4185,7 +4200,7 @@ ignoreip = ${IGNORE_IPS[*]}
 bantime = 1d
 findtime = 10m
 maxretry = 5
-banaction = iptables-ipset-proto6-allports
+banaction = nftables-allports
 
 [sshd]
 enabled = true
@@ -4203,11 +4218,13 @@ EOF
 
     local UFW_FILTER_PATH="/etc/fail2ban/filter.d/ufw-probes.conf"
     local JAIL_LOCAL_PATH="/etc/fail2ban/jail.local"
+    local NFTABLES_LOCAL_PATH="/etc/fail2ban/action.d/nftables-allports.local"
 
     # --- Idempotency Check ---
-    if [[ -f "$UFW_FILTER_PATH" && -f "$JAIL_LOCAL_PATH" ]] && \
+    if [[ -f "$UFW_FILTER_PATH" && -f "$JAIL_LOCAL_PATH" && -f "$NFTABLES_LOCAL_PATH" ]] && \
        cmp -s "$UFW_FILTER_PATH" <<<"$UFW_PROBES_CONFIG" && \
-       cmp -s "$JAIL_LOCAL_PATH" <<<"$JAIL_LOCAL_CONFIG"; then
+       cmp -s "$JAIL_LOCAL_PATH" <<<"$JAIL_LOCAL_CONFIG" && \
+       cmp -s "$NFTABLES_LOCAL_PATH" <<<"$NFTABLES_ALLPORTS_LOCAL"; then
         print_info "Fail2Ban is already configured correctly. Skipping."
         log "Fail2Ban configuration is already correct."
         return 0
@@ -4215,9 +4232,11 @@ EOF
 
     # --- Apply Configuration ---
     print_info "Applying new Fail2Ban configuration..."
-    mkdir -p /etc/fail2ban/filter.d
+    mkdir -p /etc/fail2ban/filter.d /etc/fail2ban/action.d
+    rm -f /etc/fail2ban/action.d/nftables-common.local 2>/dev/null || true
     echo "$UFW_PROBES_CONFIG" > "$UFW_FILTER_PATH"
     echo "$JAIL_LOCAL_CONFIG" > "$JAIL_LOCAL_PATH"
+    echo "$NFTABLES_ALLPORTS_LOCAL" > "$NFTABLES_LOCAL_PATH"
 
     # --- Ensure the log file exists BEFORE restarting the service ---
     if [[ ! -f /var/log/ufw.log ]]; then
@@ -6173,7 +6192,7 @@ generate_summary() {
     # Adjust verification commands based on selection
     if [[ "$IDS_INSTALLED" == "fail2ban" ]]; then
         printf "  %-28s ${CYAN}%s${NC}\n" "- Fail2Ban sshd jail:" "sudo fail2ban-client status sshd"
-        printf "  %-28s ${CYAN}%s${NC}\n" "- IPSet banned IPs:" "sudo ipset list"
+        printf "  %-28s ${CYAN}%s${NC}\n" "- nftables drop counters:" "sudo nft list table inet f2b-table"
     elif [[ "$IDS_INSTALLED" == "crowdsec" ]]; then
         printf "  %-28s ${CYAN}%s${NC}\n" "- CrowdSec status:" "sudo cscli metrics"
         printf "  %-28s ${CYAN}%s${NC}\n" "- CrowdSec bans:" "sudo cscli decisions list"
